@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 
 REM 设置你的 Go 项目名称和版本
 set project_name=huggingface_go
-set project_version=v4
+set project_version=v5
 
 REM 定义目标平台和架构的数组
 set platforms=windows linux darwin

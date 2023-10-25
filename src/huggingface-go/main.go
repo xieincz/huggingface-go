@@ -24,10 +24,19 @@ func main() {
 		flag.Usage()
 		return
 	}
+	if !strings.HasPrefix(url, "https://huggingface.co/") {
+		fmt.Printf("invalid url: %s\n", url)
+		return
+	}
+	if !strings.HasSuffix(proxyURLHead, "/") {
+		proxyURLHead += "/"
+	}
 
 	// 提取文件名和链接
 	// 使用 strings.TrimSuffix 函数去掉 "/tree/main"
-	modelURL := strings.TrimSuffix(url, "/tree/main")
+	modelURL := strings.TrimSuffix(url, "/tree/main/")
+	modelURL = strings.TrimSuffix(modelURL, "/tree/main")
+	modelURL = strings.TrimSuffix(modelURL, "/")
 	modelName := path.Base(modelURL)
 	fmt.Printf("model/datasets name: %s\n", modelName)
 	fmt.Printf("model/datasets url: %s\n", modelURL)
@@ -44,7 +53,7 @@ func main() {
 	}
 
 	// 拼接代理链接
-	proxyURL := proxyURLHead + urlEncode(url)
+	proxyURL := proxyURLHead + urlEncode(modelURL+"/tree/main")
 
 	// 发起HTTP请求获取页面内容
 	response, err := http.Get(proxyURL)
@@ -71,14 +80,12 @@ func main() {
 		fmt.Printf("downloading file %s\n", spanText)
 		// 拼接文件下载链接
 		fileURL := modelURL + "/resolve/main/" + spanText
-
 		//拼接文件下载代理链接
 		proxyFileURL := proxyURLHead + urlEncode(fileURL)
 		// 下载文件并保存到目标文件夹
 		if err := downloadFileWithProgressBar(proxyFileURL, path.Join(targetFolder, spanText)); err != nil {
 			fmt.Printf("cannot download file %s: %v\n", spanText, err)
 		}
-
 	})
 	fmt.Println("download task completed")
 }
