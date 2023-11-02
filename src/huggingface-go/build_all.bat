@@ -3,7 +3,6 @@ setlocal enabledelayedexpansion
 
 REM 设置你的 Go 项目名称和版本
 set project_name=huggingface_go
-set project_version=v5
 
 REM 定义目标平台和架构的数组
 set platforms=windows linux darwin
@@ -14,7 +13,7 @@ for %%p in (%platforms%) do (
     for %%a in (%architectures%) do (
         set platform=%%p
         set architecture=%%a
-        set output_name=!project_name!_!platform!_!architecture!_!project_version!
+        set output_name=!project_name!_!platform!_!architecture!
 
         echo Compiling for !platform! !architecture!
         
