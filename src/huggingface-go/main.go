@@ -19,10 +19,11 @@ import (
 )
 
 func main() {
-	var url, targetParentFolder, proxyURLHead string
+	var url, targetParentFolder, proxyURLHead, homepage string
 	flag.StringVar(&url, "u", "", "huggingface url,such as: https://huggingface.co/datasets/Mizukiluke/ureader-instruction-1.0")
 	flag.StringVar(&targetParentFolder, "f", "./", "path to your target folder")
 	flag.StringVar(&proxyURLHead, "p", "https://worker-share-proxy-01f5.xieincz.tk/", "proxy url")
+	flag.StringVar(&homepage, "homepage", "https://github.com/xieincz/huggingface-go", "Homepage URL")
 	flag.Parse()
 
 	if url == "" {
@@ -58,7 +59,7 @@ func main() {
 	}
 	// 递归获取文件列表
 	fmt.Println("fetching file list... \nthis may take a while")
-	entries, err := fetchDirectoryEntriesRecursively(modelURL+"/tree/main", proxyURLHead)
+	entries, err := fetchDirectoryEntriesRecursively(proxyURLHead, modelURL+"/tree/main", "")
 	if err != nil {
 		fmt.Printf("cannot fetch entries: %v\n", err)
 		return
@@ -91,8 +92,12 @@ func main() {
 	fmt.Println("download task completed")
 }
 
-func fetchDirectoryEntriesRecursively(url, proxyURLHead string) ([]map[string]interface{}, error) {
+func fetchDirectoryEntriesRecursively(proxyURLHead, baseURL, path string) ([]map[string]interface{}, error) {
 	res := make([]map[string]interface{}, 0)
+	url := baseURL
+	if path != "" {
+		url += "/" + path
+	}
 	proxyURL := proxyURLHead + urlEncode(url)
 	response, err := http.Get(proxyURL)
 	if err != nil {
@@ -110,7 +115,7 @@ func fetchDirectoryEntriesRecursively(url, proxyURLHead string) ([]map[string]in
 	dataProps, exists := selection.Attr("data-props")
 	if !exists {
 		fmt.Println("current url:", url)
-		fmt.Println("selection:", document.Text())
+		fmt.Println("current proxy url:", proxyURL)
 		return nil, fmt.Errorf("data-props attribute not found")
 	}
 
@@ -123,8 +128,7 @@ func fetchDirectoryEntriesRecursively(url, proxyURLHead string) ([]map[string]in
 		if entry["type"] == "file" {
 			res = append(res, entry)
 		} else if entry["type"] == "directory" {
-			dirURL := url + "/" + entry["path"].(string)
-			subDirEntries, err := fetchDirectoryEntriesRecursively(dirURL, proxyURLHead)
+			subDirEntries, err := fetchDirectoryEntriesRecursively(proxyURLHead, baseURL, entry["path"].(string))
 			if err != nil {
 				return nil, err
 			}
@@ -138,7 +142,45 @@ func fetchDirectoryEntriesRecursively(url, proxyURLHead string) ([]map[string]in
 }
 
 func urlEncode(s string) string {
-	return url.QueryEscape(s)
+	return url.QueryEscape(encode(s))
+}
+
+// 将url中的其他语言的字符转义
+var replaceDic = map[string]string{
+	"%2D": "-",
+	"%5F": "_",
+	"%2E": ".",
+	"%21": "!",
+	"%7E": "~",
+	"%2A": "*",
+	"%27": "'",
+	"%28": "(",
+	"%29": ")",
+	"%3B": ";",
+	"%3A": ":",
+	"%40": "@",
+	"%26": "&",
+	"%3D": "=",
+	"%2B": "+",
+	"%24": "$",
+	"%2C": ",",
+	"%2F": "/",
+	"%3F": "?",
+	"%23": "#",
+	"%25": "%",
+}
+
+func encode(s string) string {
+	u, err := url.Parse(s)
+	if err != nil {
+		fmt.Println("Error parsing URL: ", err)
+		return ""
+	}
+	u.Path = url.PathEscape(u.Path)
+	for k, v := range replaceDic {
+		u.Path = strings.ReplaceAll(u.Path, k, v)
+	}
+	return strings.ReplaceAll(u.String(), "%25", "%")
 }
 
 func extractEntries(dataProps string) ([]map[string]interface{}, error) {
