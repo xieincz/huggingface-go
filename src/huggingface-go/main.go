@@ -119,7 +119,7 @@ func fetchDirectoryEntriesRecursively(proxyURLHead, baseURL, path string) ([]map
 		return nil, fmt.Errorf("data-props attribute not found")
 	}
 
-	entries, err := extractEntries(dataProps)
+	entries, err := extractEntries(dataProps, proxyURLHead)
 	if err != nil {
 		return nil, err
 	}
@@ -183,12 +183,45 @@ func encode(s string) string {
 	return strings.ReplaceAll(u.String(), "%25", "%")
 }
 
-func extractEntries(dataProps string) ([]map[string]interface{}, error) {
+func extractEntries(dataProps, proxyURLHead string) ([]map[string]interface{}, error) {
 	var props map[string]interface{}
 	err := json.Unmarshal([]byte(dataProps), &props)
 	if err != nil {
 		return nil, err
 	}
+
+	nextURL := props["nextURL"]
+	fmt.Println("nextURL:", nextURL)
+	if nextURL != nil {
+		proxyURL := proxyURLHead + urlEncode("https://huggingface.co"+nextURL.(string))
+		response, err := http.Get(proxyURL)
+		if err != nil {
+			fmt.Println("Error:", err)
+			return nil, err
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			fmt.Println("Error reading response body:", err)
+			return nil, err
+		}
+		// 解析JSON响应
+		var data []interface{}
+		if err := json.Unmarshal(body, &data); err != nil {
+			fmt.Println("Error decoding JSON:", err)
+			return nil, err
+		}
+		dataMaps := make([]map[string]interface{}, len(data))
+		for i, v := range data {
+			dataMap, ok := v.(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("v is not a valid object")
+			}
+			dataMaps[i] = dataMap
+		}
+		return dataMaps, nil
+	}
+
 	entriesValue, exists := props["entries"]
 	if !exists {
 		return nil, fmt.Errorf("entries not found in data-props")
