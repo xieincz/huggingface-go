@@ -64,10 +64,21 @@ func main() {
 		fmt.Printf("cannot fetch entries: %v\n", err)
 		return
 	}
+	totalFileSize := 0.0
+	fileCount := 0
+	for _, entry := range entries {
+		totalFileSize += entry["size"].(float64)
+		fileCount += 1
+	}
+	fmt.Printf("Total number of files: %d\n", fileCount)
+	convertedSize, unit := convertBytes(totalFileSize)
+	fmt.Printf("Total size of files: %.2f %s\n", convertedSize, unit)
+	cnt := 1
 	for _, entry := range entries {
 		// 获取文件路径
 		filePath := entry["path"].(string)
-		fmt.Printf("downloading file %s\n", filePath)
+		fmt.Printf("downloading file %d/%d: %s\n", cnt, fileCount, filePath)
+		cnt += 1
 		filePath = path.Join(targetFolder, filePath)
 		// 获取文件夹路径
 		dirPath := filepath.Dir(filePath)
@@ -90,6 +101,25 @@ func main() {
 
 	}
 	fmt.Println("download task completed")
+}
+
+// Helper function to convert Bytes to appropriate unit
+func convertBytes(bytes float64) (float64, string) {
+	const (
+		KB = 1 << 10
+		MB = 1 << 20
+		GB = 1 << 30
+	)
+	switch {
+	case bytes >= GB:
+		return bytes / GB, "GB"
+	case bytes >= MB:
+		return bytes / MB, "MB"
+	case bytes >= KB:
+		return bytes / KB, "KB"
+	default:
+		return bytes, "B"
+	}
 }
 
 func fetchDirectoryEntriesRecursively(proxyURLHead, baseURL, path string) ([]map[string]interface{}, error) {
