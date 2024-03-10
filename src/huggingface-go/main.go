@@ -15,16 +15,19 @@ import (
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/cheggaaa/pb/v3"
+
+	"encoding/base64"
+	"strconv"
 )
 
 var huggingfaceHead string
 
 func main() {
 	var url, targetParentFolder, proxyURLHead, homepage string
-	flag.StringVar(&url, "u", "", "huggingface url,such as: https://hf-mirror.com/Finnish-NLP/t5-large-nl36-finnish/tree/main")
+	flag.StringVar(&url, "u", "", "huggingface url, such as: https://hf-mirror.com/Finnish-NLP/t5-large-nl36-finnish/tree/main")
 	flag.StringVar(&targetParentFolder, "f", "./", "path to your target folder")
 	flag.StringVar(&proxyURLHead, "p", "", "proxy url, leave it empty if you don't need it")
-	flag.StringVar(&homepage, "homepage", "https://github.com/xieincz/huggingface-go", "Homepage URL")
+	flag.StringVar(&homepage, "homepage", "https://github.com/xieincz/huggingface-go", "homepage url of this tool")
 	flag.Parse()
 
 	if url == "" {
@@ -184,35 +187,60 @@ func extractEntries(dataProps, proxyURLHead string) ([]map[string]interface{}, e
 	}
 
 	nextURL := props["nextURL"]
-	fmt.Println("nextURL:", nextURL)
 	if nextURL != nil {
-		proxyURL := proxyURLHead + huggingfaceHead + nextURL.(string)
-		response, err := http.Get(proxyURL)
-		if err != nil {
-			fmt.Println("Error:", err)
-			return nil, err
-		}
-		defer response.Body.Close()
-		body, err := io.ReadAll(response.Body)
-		if err != nil {
-			fmt.Println("Error reading response body:", err)
-			return nil, err
-		}
-		// 解析JSON响应
-		var data []interface{}
-		if err := json.Unmarshal(body, &data); err != nil {
-			fmt.Println("Error decoding JSON:", err)
-			return nil, err
-		}
-		dataMaps := make([]map[string]interface{}, len(data))
-		for i, v := range data {
-			dataMap, ok := v.(map[string]interface{})
-			if !ok {
-				return nil, fmt.Errorf("v is not a valid object")
+		baseURL := proxyURLHead + huggingfaceHead + strings.Split(nextURL.(string), "?cursor=")[0]
+		last := ""
+		entries := make([]map[string]interface{}, 0)
+		for {
+			var url string
+			if last == "" {
+				url = baseURL
+			} else {
+				cursor := base64.StdEncoding.EncodeToString([]byte(base64.StdEncoding.EncodeToString([]byte(last)) + ":" + strconv.Itoa(len(entries))))
+				url = baseURL + "?cursor=" + cursor + "&expand=true"
 			}
-			dataMaps[i] = dataMap
+			resp, err := http.Get(url)
+			if err != nil {
+				fmt.Println("Error:", err)
+				return nil, err
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				fmt.Println("Error reading response body:", err)
+				return nil, err
+			}
+			var data []interface{}
+			err = json.Unmarshal(body, &data)
+			if err != nil {
+				var responseDict map[string]interface{}
+				err = json.Unmarshal(body, &responseDict)
+				if err != nil {
+					fmt.Println("Error decoding JSON:", err)
+					return nil, err
+				}
+				if _, ok := responseDict["error"]; ok { //如果后面没有了，就会返回一个含有error的字典，其实也可以根据上一次的entries长度来判断是否结束，小于50说明后面没有了
+					break
+				}
+				fmt.Println("Error decoding JSON:", err)
+				return nil, err
+			}
+			dataMaps := make([]map[string]interface{}, len(data))
+			for i, v := range data {
+				dataMap, ok := v.(map[string]interface{})
+				if !ok {
+					return nil, fmt.Errorf("v is not a valid object")
+				}
+				dataMaps[i] = dataMap
+			}
+			entries = append(entries, dataMaps...)
+			lastBytes, err := json.Marshal(map[string]string{"file_name": dataMaps[len(dataMaps)-1]["path"].(string)})
+			if err != nil {
+				panic(err)
+			}
+			last = string(lastBytes)
 		}
-		return dataMaps, nil
+		return entries, nil
 	}
 
 	entriesValue, exists := props["entries"]
