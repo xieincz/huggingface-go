@@ -51,25 +51,25 @@ func main() {
 	tmp = strings.Split(url, "/")
 	huggingfaceHead = tmp[0] + "//" + tmp[2] //e.g. https://huggingface.co
 
-	fmt.Printf("model/datasets name: %s\n", modelName)
-	fmt.Printf("model/datasets url: %s\n", modelURL)
-	fmt.Printf("branch: %s\n", branch)
+	fmt.Printf("Model/Datasets name: %s\n", modelName)
+	fmt.Printf("Model/Datasets url: %s\n", modelURL)
+	fmt.Printf("Branch: %s\n", branch)
 
 	// 创建目标文件夹
 	targetFolder := path.Join(targetParentFolder, modelName)
-	if _, err := os.Stat(targetFolder); err == nil {
-		fmt.Printf("target folder %s already exists\n", targetFolder)
+	/*if _, err := os.Stat(targetFolder); err == nil {
+		fmt.Printf("Target folder %s already exists\n", targetFolder)
 		return
-	}
+	}*/
 	if err := os.MkdirAll(targetFolder, 0755); err != nil {
-		fmt.Printf("cannot create target folder: %v\n", err)
+		fmt.Printf("Cannot create target folder: %v\n", err)
 		return
 	}
 	// 递归获取文件列表
-	fmt.Println("fetching file list... \nthis may take a while")
+	fmt.Println("Fetching file list... \nthis may take a while")
 	entries, err := fetchDirectoryEntriesRecursively(proxyURLHead, modelURL+"/tree/"+branch, urlFolder)
 	if err != nil {
-		fmt.Printf("cannot fetch entries: %v\n", err)
+		fmt.Printf("Cannot fetch entries: %v\n", err)
 		return
 	}
 	totalFileSize := 0.0
@@ -85,9 +85,21 @@ func main() {
 	for _, entry := range entries {
 		// 获取文件路径
 		filePath := entry["path"].(string)
-		fmt.Printf("downloading file %d/%d: %s\n", cnt, fileCount, filePath)
+		fmt.Printf("Downloading file %d/%d: %s\n", cnt, fileCount, filePath)
 		cnt += 1
 		filePath = path.Join(targetFolder, filePath)
+		// 如果文件已经存在并且大小相同，则跳过
+		stat, err := os.Stat(filePath)
+		if err == nil {
+			if stat.Size() == int64(entry["size"].(float64)) {
+				fmt.Printf("File %s already exists and has the same size, skipping\n", filePath)
+				continue
+			}
+		} else if !os.IsNotExist(err) {
+			// 处理其他错误
+			fmt.Println("Error getting file info:", err)
+			fmt.Println("Attempting to download the file anyway")
+		}
 		// 获取文件夹路径
 		dirPath := filepath.Dir(filePath)
 		// 检查文件夹是否存在，如果不存在则创建它
@@ -104,11 +116,11 @@ func main() {
 		proxyFileURL := proxyURLHead + fileURL
 		// 下载文件并保存到目标文件夹
 		if err := downloadFileWithProgressBar(proxyFileURL, filePath, int(entry["size"].(float64))); err != nil {
-			fmt.Printf("cannot download file %s: %v\n", filePath, err)
+			fmt.Printf("Cannot download file %s: %v\n", filePath, err)
 		}
 
 	}
-	fmt.Println("download task completed")
+	fmt.Println("Download task completed")
 }
 
 // Helper function to convert Bytes to appropriate unit
@@ -152,8 +164,8 @@ func fetchDirectoryEntriesRecursively(proxyURLHead, baseURL, path string) ([]map
 
 	dataProps, exists := selection.Attr("data-props")
 	if !exists {
-		fmt.Println("current url:", url)
-		fmt.Println("current proxy url:", proxyURL)
+		fmt.Println("Current url:", url)
+		fmt.Println("Current proxy url:", proxyURL)
 		return nil, fmt.Errorf("data-props attribute not found")
 	}
 
@@ -245,17 +257,17 @@ func extractEntries(dataProps, proxyURLHead string) ([]map[string]interface{}, e
 
 	entriesValue, exists := props["entries"]
 	if !exists {
-		return nil, fmt.Errorf("entries not found in data-props")
+		return nil, fmt.Errorf("Entries not found in data-props")
 	}
 	entries, ok := entriesValue.([]interface{})
 	if !ok {
-		return nil, fmt.Errorf("entries is not a valid array")
+		return nil, fmt.Errorf("Entries is not a valid array")
 	}
 	entryMaps := make([]map[string]interface{}, len(entries))
 	for i, entry := range entries {
 		entryMap, ok := entry.(map[string]interface{})
 		if !ok {
-			return nil, fmt.Errorf("entry is not a valid object")
+			return nil, fmt.Errorf("Entry is not a valid object")
 		}
 		entryMaps[i] = entryMap
 	}
