@@ -24,10 +24,14 @@ var huggingfaceHead string
 
 func main() {
 	var url, targetParentFolder, proxyURLHead, homepage string
+	var disableDefaultMirror bool
 	flag.StringVar(&url, "u", "", "huggingface url, such as: https://hf-mirror.com/Finnish-NLP/t5-large-nl36-finnish/tree/main")
 	flag.StringVar(&targetParentFolder, "f", "./", "path to your target folder")
 	flag.StringVar(&proxyURLHead, "p", "", "proxy url, leave it empty if you don't need it")
 	flag.StringVar(&homepage, "homepage", "https://github.com/xieincz/huggingface-go", "homepage url of this tool")
+	flag.StringVar(&huggingfaceHead, "m", "https://hf-mirror.com", "mirror url of huggingface, use this if you want to use a different mirror, use -d to disable default mirror")
+	flag.BoolVar(&disableDefaultMirror, "d", false, "disable default mirror")
+
 	flag.Parse()
 
 	if url == "" {
@@ -49,7 +53,10 @@ func main() {
 
 	//提取出域名
 	tmp = strings.Split(url, "/")
-	huggingfaceHead = tmp[0] + "//" + tmp[2] //e.g. https://huggingface.co
+	if disableDefaultMirror {
+		huggingfaceHead = tmp[0] + "//" + tmp[2] //e.g. https://huggingface.co
+		fmt.Printf("Mirror has been disabled, using %s as the mirror\n", huggingfaceHead)
+	}
 
 	fmt.Printf("Model/Datasets name: %s\n", modelName)
 	fmt.Printf("Model/Datasets url: %s\n", modelURL)
