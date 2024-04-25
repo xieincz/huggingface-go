@@ -56,6 +56,9 @@ func main() {
 	if disableDefaultMirror {
 		huggingfaceHead = tmp[0] + "//" + tmp[2] //e.g. https://huggingface.co
 		fmt.Printf("Mirror has been disabled, using %s as the mirror\n", huggingfaceHead)
+	} else {
+		//将huggingfaceHead替换到modelURL
+		modelURL = strings.Replace(modelURL, tmp[0]+"//"+tmp[2], huggingfaceHead, 1)
 	}
 
 	fmt.Printf("Model/Datasets name: %s\n", modelName)
