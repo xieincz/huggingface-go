@@ -1,139 +1,397 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
-
-	"flag"
+	"net/url"
 	"os"
 	"path"
-	"strings"
-
 	"path/filepath"
+	"strings"
+	"time"
 
-	"github.com/PuerkitoBio/goquery"
 	"github.com/cheggaaa/pb/v3"
-
-	"encoding/base64"
-	"strconv"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/time/rate"
 )
 
-var huggingfaceHead string
+// --- Constants ---
+const (
+	defaultMirrorURL   = "https://hf-mirror.com"
+	apiPathPrefix      = "/api/models/"
+	resolvePathPrefix  = "/resolve/"
+	treePathPrefix     = "/tree/"
+	defaultBranch      = "main"
+	maxRetries         = 5                // Increased retries for better resilience
+	retryDelay         = 3 * time.Second  // Slightly longer initial delay
+	defaultWorkerCount = 8                // Default concurrent workers
+	httpTimeout        = 30 * time.Minute // HTTP request timeout
+	rateLimit          = 10               // Limit API requests to 10 per second
+	lfsFileThreshold   = 10 * 1024 * 1024 // 10MB threshold for LFS files
+)
 
-func main() {
-	var url, targetParentFolder, proxyURLHead, homepage string
-	var disableDefaultMirror bool
-	flag.StringVar(&url, "u", "", "huggingface url, such as: https://hf-mirror.com/Finnish-NLP/t5-large-nl36-finnish/tree/main")
-	flag.StringVar(&targetParentFolder, "f", "./", "path to your target folder")
-	flag.StringVar(&proxyURLHead, "p", "", "proxy url, leave it empty if you don't need it")
-	flag.StringVar(&homepage, "homepage", "https://github.com/xieincz/huggingface-go", "homepage url of this tool")
-	flag.StringVar(&huggingfaceHead, "m", "https://hf-mirror.com", "mirror url of huggingface, use this if you want to use a different mirror, use -d to disable default mirror")
-	flag.BoolVar(&disableDefaultMirror, "d", false, "disable default mirror")
-
-	flag.Parse()
-
-	if url == "" {
-		flag.Usage()
-		return
-	}
-
-	// 提取文件名和链接
-	modelURL := strings.Split(url, "/tree/")[0]
-	branch := strings.Split(strings.Split(url, "/tree/")[1], "/")[0] //需要输入url必须含branch，否则后面会出问题
-	modelName := path.Base(modelURL)
-	tmp := strings.Split(url, branch+"/") //需要输入url末尾不含/，否则后面会出问题
-	var urlFolder string
-	if len(tmp) < 2 {
-		urlFolder = ""
-	} else {
-		urlFolder = tmp[1]
-	}
-
-	//提取出域名
-	tmp = strings.Split(url, "/")
-	if disableDefaultMirror {
-		huggingfaceHead = tmp[0] + "//" + tmp[2] //e.g. https://huggingface.co
-		fmt.Printf("Mirror has been disabled, using %s as the mirror\n", huggingfaceHead)
-	} else {
-		//将huggingfaceHead替换到modelURL
-		modelURL = strings.Replace(modelURL, tmp[0]+"//"+tmp[2], huggingfaceHead, 1)
-	}
-
-	fmt.Printf("Model/Datasets name: %s\n", modelName)
-	fmt.Printf("Model/Datasets url: %s\n", modelURL)
-	fmt.Printf("Branch: %s\n", branch)
-
-	// 创建目标文件夹
-	targetFolder := path.Join(targetParentFolder, modelName)
-	/*if _, err := os.Stat(targetFolder); err == nil {
-		fmt.Printf("Target folder %s already exists\n", targetFolder)
-		return
-	}*/
-	if err := os.MkdirAll(targetFolder, 0755); err != nil {
-		fmt.Printf("Cannot create target folder: %v\n", err)
-		return
-	}
-	// 递归获取文件列表
-	fmt.Println("Fetching file list... \nthis may take a while")
-	entries, err := fetchDirectoryEntriesRecursively(proxyURLHead, modelURL+"/tree/"+branch, urlFolder)
-	if err != nil {
-		fmt.Printf("Cannot fetch entries: %v\n", err)
-		return
-	}
-	totalFileSize := 0.0
-	fileCount := 0
-	for _, entry := range entries {
-		totalFileSize += entry["size"].(float64)
-		fileCount += 1
-	}
-	fmt.Printf("Total number of files: %d\n", fileCount)
-	convertedSize, unit := convertBytes(totalFileSize)
-	fmt.Printf("Total size of files: %.2f %s\n", convertedSize, unit)
-	cnt := 1
-	for _, entry := range entries {
-		// 获取文件路径
-		filePath := entry["path"].(string)
-		fmt.Printf("Downloading file %d/%d: %s\n", cnt, fileCount, filePath)
-		cnt += 1
-		filePath = path.Join(targetFolder, filePath)
-		// 如果文件已经存在并且大小相同，则跳过
-		stat, err := os.Stat(filePath)
-		if err == nil {
-			if stat.Size() == int64(entry["size"].(float64)) {
-				fmt.Printf("File %s already exists and has the same size, skipping\n", filePath)
-				continue
-			}
-		} else if !os.IsNotExist(err) {
-			// 处理其他错误
-			fmt.Println("Error getting file info:", err)
-			fmt.Println("Attempting to download the file anyway")
-		}
-		// 获取文件夹路径
-		dirPath := filepath.Dir(filePath)
-		// 检查文件夹是否存在，如果不存在则创建它
-		if _, err := os.Stat(dirPath); os.IsNotExist(err) {
-			err := os.MkdirAll(dirPath, os.ModePerm)
-			if err != nil {
-				fmt.Println("Error creating directory:", err)
-				return
-			}
-		}
-		// 拼接文件下载链接
-		fileURL := modelURL + "/resolve/" + branch + "/" + entry["path"].(string)
-		//拼接文件下载代理链接
-		proxyFileURL := proxyURLHead + fileURL
-		// 下载文件并保存到目标文件夹
-		if err := downloadFileWithProgressBar(proxyFileURL, filePath, int(entry["size"].(float64))); err != nil {
-			fmt.Printf("Cannot download file %s: %v\n", filePath, err)
-		}
-
-	}
-	fmt.Println("Download task completed")
+// --- Global HTTP Client ---
+// Using a shared transport allows for better connection reuse.
+var httpClient = &http.Client{
+	Timeout: httpTimeout,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConnsPerHost: 10,
+	},
 }
 
-// Helper function to convert Bytes to appropriate unit
+// FileEntry represents information about a file to be downloaded.
+type FileEntry struct {
+	Path string `json:"path"`
+	Size int64  `json:"size"`
+	Type string `json:"type"`
+	URL  string
+}
+
+// Downloader encapsulates the download logic and configuration.
+type Downloader struct {
+	repoID          string
+	branch          string
+	targetSubFolder string // User-specified subfolder to download
+	localModelDir   string // Local root directory for saving
+	mirrorHost      string
+	proxyPrefix     string
+	workerCount     int
+	filesToDownload []FileEntry
+	totalSize       int64
+	apiRateLimiter  *rate.Limiter
+}
+
+// NewDownloader creates a Downloader instance by parsing user input.
+func NewDownloader(rawURL, targetParentFolder, proxyURLHead, mirrorURL string, disableDefaultMirror bool, workers int) (*Downloader, error) {
+	rawURL = strings.TrimSuffix(rawURL, "/")
+
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %w", err)
+	}
+
+	d := &Downloader{
+		proxyPrefix:    proxyURLHead,
+		workerCount:    workers,
+		apiRateLimiter: rate.NewLimiter(rate.Limit(rateLimit), 1),
+	}
+
+	// Determine the Hugging Face domain to use (mirror or official)
+	if disableDefaultMirror {
+		d.mirrorHost = parsedURL.Scheme + "://" + parsedURL.Host
+		fmt.Printf("Default mirror disabled, using %s as base URL\n", d.mirrorHost)
+	} else {
+		d.mirrorHost = mirrorURL
+	}
+
+	// Parse Repo ID, Branch, and Subfolder
+	pathParts := strings.Split(strings.TrimPrefix(parsedURL.Path, "/"), "/")
+	treeIndex := -1
+	for i, part := range pathParts {
+		if part == "tree" {
+			treeIndex = i
+			break
+		}
+	}
+
+	if treeIndex == -1 { // URL does not contain /tree/
+		d.repoID = strings.Join(pathParts, "/")
+		d.branch = defaultBranch
+	} else {
+		if treeIndex+1 >= len(pathParts) {
+			return nil, errors.New("URL format error: missing branch name after /tree/")
+		}
+		d.repoID = strings.Join(pathParts[:treeIndex], "/")
+		d.branch = pathParts[treeIndex+1]
+		if treeIndex+2 < len(pathParts) {
+			d.targetSubFolder = strings.Join(pathParts[treeIndex+2:], "/")
+		}
+	}
+
+	modelName := path.Base(d.repoID)
+	d.localModelDir = filepath.Join(targetParentFolder, modelName)
+
+	return d, nil
+}
+
+// fetchFileListRecursive recursively fetches the file list using the Hugging Face API.
+func (d *Downloader) fetchFileListRecursive(ctx context.Context, currentPath string) ([]FileEntry, error) {
+	var entries []FileEntry
+
+	apiURL, err := url.Parse(d.mirrorHost)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse mirror host: %w", err)
+	}
+	apiURL = apiURL.JoinPath(apiPathPrefix, d.repoID, treePathPrefix, d.branch, currentPath)
+	reqURL := d.proxyPrefix + apiURL.String()
+
+	// Wait for the rate limiter
+	if err := d.apiRateLimiter.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create API request for %s: %w", reqURL, err)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("API request failed for %s: %w", reqURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API request failed for %s with status code: %d", reqURL, resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read API response body: %w", err)
+	}
+
+	var rawEntries []FileEntry
+	if err := json.Unmarshal(body, &rawEntries); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON from %s: %w", reqURL, err)
+	}
+
+	for _, entry := range rawEntries {
+		if entry.Type == "file" {
+			// If a subfolder is specified, only include files within that subfolder.
+			if d.targetSubFolder == "" || strings.HasPrefix(entry.Path, d.targetSubFolder+"/") || entry.Path == d.targetSubFolder {
+				fileURL, _ := url.Parse(d.mirrorHost)
+				fileURL = fileURL.JoinPath(d.repoID, "resolve", d.branch, entry.Path)
+				entry.URL = fileURL.String()
+				entries = append(entries, entry)
+			}
+		} else if entry.Type == "directory" {
+			subEntries, err := d.fetchFileListRecursive(ctx, entry.Path)
+			if err != nil {
+				return nil, err // Propagate errors upwards
+			}
+			entries = append(entries, subEntries...)
+		}
+	}
+
+	return entries, nil
+}
+
+// Download starts the entire download process.
+func (d *Downloader) Download(ctx context.Context) error {
+	fmt.Println("Fetching file list... (This may take a moment)")
+	// Always start fetching from the repository root and filter during inclusion.
+	allFiles, err := d.fetchFileListRecursive(ctx, "")
+	if err != nil {
+		return fmt.Errorf("failed to fetch file list: %w", err)
+	}
+	d.filesToDownload = allFiles
+
+	if len(d.filesToDownload) == 0 {
+		fmt.Println("No files found. Please check the URL or the specified subfolder.")
+		return nil
+	}
+
+	// Calculate total size
+	for _, file := range d.filesToDownload {
+		d.totalSize += file.Size
+	}
+
+	convertedSize, unit := convertBytes(float64(d.totalSize))
+	fmt.Printf("Model/Dataset Name: %s\n", path.Base(d.repoID))
+	if d.targetSubFolder != "" {
+		fmt.Printf("Target Subfolder: %s\n", d.targetSubFolder)
+	}
+	fmt.Printf("Branch: %s\n", d.branch)
+	fmt.Printf("Total files to download: %d\n", len(d.filesToDownload))
+	fmt.Printf("Total file size: %.2f %s\n", convertedSize, unit)
+
+	// Create local model directory
+	if err := os.MkdirAll(d.localModelDir, 0755); err != nil {
+		return fmt.Errorf("could not create target folder: %w", err)
+	}
+
+	// --- Concurrent Downloading ---
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(d.workerCount)
+
+	totalBar := pb.New64(d.totalSize).Set(pb.Bytes, true).SetTemplateString(`{{ "Total Progress:" }} {{ bar . }} {{percent . }} {{speed . "%s/s"}} {{etime .}}`)
+	// FIX: Do NOT call totalBar.Start() here. The pool will manage it.
+
+	pool, err := pb.StartPool(totalBar)
+	if err != nil {
+		return err
+	}
+	defer pool.Stop()
+
+	for _, file := range d.filesToDownload {
+		file := file // Capture loop variable
+		g.Go(func() error {
+			return d.processFileDownload(ctx, file, pool, totalBar)
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		// The final totalBar.Finish() will not be called on error, so we print a newline
+		// to ensure the next shell prompt starts on a new line.
+		fmt.Println()
+		return err
+	}
+
+	fmt.Println("\nAll download tasks completed successfully!")
+	return nil
+}
+
+// processFileDownload handles the download logic for a single file.
+func (d *Downloader) processFileDownload(ctx context.Context, file FileEntry, pool *pb.Pool, totalBar *pb.ProgressBar) error {
+	localRelativePath := file.Path
+	if d.targetSubFolder != "" {
+		localRelativePath = strings.TrimPrefix(file.Path, d.targetSubFolder+"/")
+	}
+	localFilePath := filepath.Join(d.localModelDir, localRelativePath)
+
+	// Check if the file exists and has the correct size
+	if stat, err := os.Stat(localFilePath); err == nil {
+		if stat.Size() == file.Size {
+			// Use a mutex or a synchronized print function if this output gets garbled,
+			// but for simple infrequent messages like this, it's often fine.
+			// fmt.Printf("File %s already exists with the same size, skipping.\n", localRelativePath)
+			totalBar.Add64(file.Size) // Update total progress even if skipped
+			return nil
+		}
+	}
+
+	// Note: The double '%%' is necessary to escape the percent sign for fmt.Sprintf.
+	fileBar := pb.New64(file.Size).Set(pb.Bytes, true).SetTemplateString(fmt.Sprintf(`{{ "%s:" }} {{ bar . }} {{percent . }} {{speed . "%%s/s"}}`, path.Base(file.Path)))
+	pool.Add(fileBar)
+	// We don't defer fileBar.Finish() here because the pool manages its lifecycle.
+
+	err := d.downloadFileWithRetry(ctx, file, localFilePath, fileBar, totalBar)
+	if err != nil {
+		errorMsg := fmt.Sprintf("Failed to download %s after max retries: %v", file.Path, err)
+		fileBar.SetTemplateString(fmt.Sprintf(`{{ "%s:" }} {{ "Download Failed" }}`, path.Base(file.Path))).Finish()
+		// Return a new error to avoid race conditions on the original error
+		return errors.New(errorMsg)
+	}
+	fileBar.Finish()
+	return nil
+}
+
+// downloadFileWithRetry handles the download of a single file with retry logic.
+func (d *Downloader) downloadFileWithRetry(ctx context.Context, file FileEntry, localPath string, bar, totalBar *pb.ProgressBar) error {
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		// Check for context cancellation before each attempt
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		err := d.downloadFileAtomically(ctx, file, localPath, bar, totalBar)
+		if err == nil {
+			return nil // Success
+		}
+		lastErr = err
+
+		// Exponential backoff for retries
+		delay := time.Duration(i*i)*time.Second + retryDelay
+		// Using the bar's writer to print the message ensures it doesn't mess up the progress bar rendering
+		bar.Set("prefix", fmt.Sprintf("Retry in %v... ", delay))
+		time.Sleep(delay)
+		bar.Set("prefix", fmt.Sprintf(`{{ "%s:" }}`, path.Base(file.Path))) // Reset prefix
+		bar.SetCurrent(0)                                                   // Reset progress bar for retry
+	}
+	return lastErr
+}
+
+// downloadFileAtomically performs the actual file download and ensures atomic writes.
+func (d *Downloader) downloadFileAtomically(ctx context.Context, file FileEntry, localPath string, bar, totalBar *pb.ProgressBar) error {
+	// Determine the starting point for a potential resume
+	var startOffset int64
+	tmpPath := localPath + ".tmp"
+	if stat, err := os.Stat(tmpPath); err == nil {
+		startOffset = stat.Size()
+	}
+
+	reqURL := d.proxyPrefix + file.URL
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set the Range header if we are resuming a download
+	if startOffset > 0 {
+		// If the existing temp file is already complete, we can skip the download
+		if startOffset == file.Size {
+			// We still need to update the total progress bar
+			totalBar.Add64(file.Size - bar.Current())
+			bar.SetCurrent(file.Size)
+			return os.Rename(tmpPath, localPath)
+		}
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", startOffset))
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Handle the response status code
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return fmt.Errorf("request for %s failed with status: %s", file.URL, resp.Status)
+	}
+
+	// Create local directories
+	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	// Open the file for writing (append if resuming)
+	openFlags := os.O_CREATE | os.O_WRONLY
+	if resp.StatusCode == http.StatusPartialContent {
+		openFlags |= os.O_APPEND
+	} else {
+		// If not resuming, truncate the file
+		openFlags |= os.O_TRUNC
+		startOffset = 0 // Reset offset just in case
+	}
+	tmpFile, err := os.OpenFile(tmpPath, openFlags, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to create temporary file: %w", err)
+	}
+	defer tmpFile.Close()
+
+	// Set the initial progress for the bars
+	bar.SetCurrent(startOffset)
+	// The total bar is updated via the proxy reader, so no need to set it manually here.
+
+	// Create a proxy reader to update progress bars
+	barReader := bar.NewProxyReader(resp.Body)
+	totalBarReader := totalBar.NewProxyReader(barReader)
+
+	// Copy data to the temporary file
+	_, err = io.Copy(tmpFile, totalBarReader)
+	if err != nil {
+		return fmt.Errorf("failed to write to file: %w", err)
+	}
+
+	// Rename the temporary file to the final destination
+	if err := os.Rename(tmpPath, localPath); err != nil {
+		return fmt.Errorf("failed to rename temporary file: %w", err)
+	}
+
+	return nil
+}
+
+// convertBytes converts bytes to a human-readable format.
 func convertBytes(bytes float64) (float64, string) {
 	const (
 		KB = 1 << 10
@@ -152,161 +410,48 @@ func convertBytes(bytes float64) (float64, string) {
 	}
 }
 
-func fetchDirectoryEntriesRecursively(proxyURLHead, baseURL, path string) ([]map[string]interface{}, error) {
-	res := make([]map[string]interface{}, 0)
-	url := baseURL
-	if path != "" {
-		url += "/" + path
+func main() {
+	var url, targetParentFolder, proxyURLHead, mirrorURL string
+	var disableDefaultMirror bool
+	var workerCount int
+
+	flag.StringVar(&url, "u", "", "Hugging Face model/dataset URL (required)")
+	flag.StringVar(&targetParentFolder, "f", "./", "Parent folder path to save the model")
+	flag.StringVar(&proxyURLHead, "p", "", "Proxy URL prefix (optional)")
+	flag.StringVar(&mirrorURL, "m", defaultMirrorURL, "Hugging Face mirror site URL")
+	flag.BoolVar(&disableDefaultMirror, "d", false, "Disable the default mirror and use the domain from the -u parameter")
+	flag.IntVar(&workerCount, "w", defaultWorkerCount, "Number of concurrent downloads")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s -u <model_url> [options]\n", os.Args[0])
+		fmt.Fprintln(os.Stderr, "Examples:")
+		fmt.Fprintf(os.Stderr, "  %s -u https://huggingface.co/google-bert/bert-base-uncased\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -u https://hf-mirror.com/core42/stable-diffusion-3-medium-diffusers/tree/main/text_encoder_3 -f D:/models\n", os.Args[0])
+		fmt.Fprintln(os.Stderr, "\nOptions:")
+		flag.PrintDefaults()
 	}
-	proxyURL := proxyURLHead + url
-	response, err := http.Get(proxyURL)
+
+	flag.Parse()
+
+	if url == "" {
+		flag.Usage()
+		return
+	}
+
+	downloader, err := NewDownloader(url, targetParentFolder, proxyURLHead, mirrorURL, disableDefaultMirror, workerCount)
 	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-
-	document, err := goquery.NewDocumentFromReader(response.Body)
-	if err != nil {
-		return nil, err
+		fmt.Fprintf(os.Stderr, "Error: Failed to initialize downloader: %v\n", err)
+		os.Exit(1)
 	}
 
-	selection := document.Find("body > div > main > div.container.relative.flex.flex-col.md\\:grid.md\\:space-y-0.w-full.md\\:grid-cols-12.space-y-4.md\\:gap-6.mb-16 > section > div:nth-child(4)")
+	// Use a context to handle graceful shutdown (e.g., on Ctrl+C)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	dataProps, exists := selection.Attr("data-props")
-	if !exists {
-		fmt.Println("Current url:", url)
-		fmt.Println("Current proxy url:", proxyURL)
-		return nil, fmt.Errorf("data-props attribute not found")
+	// You can add a signal handler here to call cancel() on interrupt
+
+	if err := downloader.Download(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: An error occurred during the download process: %v\n", err)
+		os.Exit(1)
 	}
-
-	entries, err := extractEntries(dataProps, proxyURLHead)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, entry := range entries {
-		if entry["type"] == "file" {
-			res = append(res, entry)
-		} else if entry["type"] == "directory" {
-			subDirEntries, err := fetchDirectoryEntriesRecursively(proxyURLHead, baseURL, entry["path"].(string))
-			if err != nil {
-				return nil, err
-			}
-			res = append(res, subDirEntries...)
-		} else {
-			fmt.Println("Unconsidered file type:", entry["type"])
-		}
-	}
-
-	return res, nil
-}
-
-func extractEntries(dataProps, proxyURLHead string) ([]map[string]interface{}, error) {
-	var props map[string]interface{}
-	err := json.Unmarshal([]byte(dataProps), &props)
-	if err != nil {
-		return nil, err
-	}
-
-	nextURL := props["nextURL"]
-	if nextURL != nil {
-		baseURL := proxyURLHead + huggingfaceHead + strings.Split(nextURL.(string), "?cursor=")[0]
-		last := ""
-		entries := make([]map[string]interface{}, 0)
-		for {
-			var url string
-			if last == "" {
-				url = baseURL
-			} else {
-				cursor := base64.StdEncoding.EncodeToString([]byte(base64.StdEncoding.EncodeToString([]byte(last)) + ":" + strconv.Itoa(len(entries))))
-				url = baseURL + "?cursor=" + cursor + "&expand=true"
-			}
-			resp, err := http.Get(url)
-			if err != nil {
-				fmt.Println("Error:", err)
-				return nil, err
-			}
-			defer resp.Body.Close()
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				fmt.Println("Error reading response body:", err)
-				return nil, err
-			}
-			var data []interface{}
-			err = json.Unmarshal(body, &data)
-			if err != nil {
-				var responseDict map[string]interface{}
-				err = json.Unmarshal(body, &responseDict)
-				if err != nil {
-					fmt.Println("Error decoding JSON:", err)
-					return nil, err
-				}
-				if _, ok := responseDict["error"]; ok { //如果后面没有了，就会返回一个含有error的字典，其实也可以根据上一次的entries长度来判断是否结束，小于50说明后面没有了
-					break
-				}
-				fmt.Println("Error decoding JSON:", err)
-				return nil, err
-			}
-			dataMaps := make([]map[string]interface{}, len(data))
-			for i, v := range data {
-				dataMap, ok := v.(map[string]interface{})
-				if !ok {
-					return nil, fmt.Errorf("v is not a valid object")
-				}
-				dataMaps[i] = dataMap
-			}
-			entries = append(entries, dataMaps...)
-			lastBytes, err := json.Marshal(map[string]string{"file_name": dataMaps[len(dataMaps)-1]["path"].(string)})
-			if err != nil {
-				panic(err)
-			}
-			last = string(lastBytes)
-		}
-		return entries, nil
-	}
-
-	entriesValue, exists := props["entries"]
-	if !exists {
-		return nil, fmt.Errorf("Entries not found in data-props")
-	}
-	entries, ok := entriesValue.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("Entries is not a valid array")
-	}
-	entryMaps := make([]map[string]interface{}, len(entries))
-	for i, entry := range entries {
-		entryMap, ok := entry.(map[string]interface{})
-		if !ok {
-			return nil, fmt.Errorf("Entry is not a valid object")
-		}
-		entryMaps[i] = entryMap
-	}
-	return entryMaps, nil
-}
-
-func downloadFileWithProgressBar(url, filePath string, fileSize int) error {
-	response, err := http.Get(url)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-
-	file, err := os.Create(filePath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	bar := pb.New(int(fileSize)).Set(pb.Bytes, true)
-	bar.Start()
-
-	reader := bar.NewProxyReader(response.Body)
-
-	_, err = io.Copy(file, reader)
-	if err != nil {
-		return err
-	}
-
-	bar.Finish()
-	return nil
 }
