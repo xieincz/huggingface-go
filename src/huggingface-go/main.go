@@ -20,23 +20,31 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// --- Repo Type Definition ---
+type RepoType string
+
+const (
+	RepoTypeModel   RepoType = "model"
+	RepoTypeDataset RepoType = "dataset"
+)
+
 // --- Constants ---
 const (
-	defaultMirrorURL   = "https://hf-mirror.com"
-	apiPathPrefix      = "/api/models/"
-	resolvePathPrefix  = "/resolve/"
-	treePathPrefix     = "/tree/"
-	defaultBranch      = "main"
-	maxRetries         = 5                // Increased retries for better resilience
-	retryDelay         = 3 * time.Second  // Slightly longer initial delay
-	defaultWorkerCount = 8                // Default concurrent workers
-	httpTimeout        = 30 * time.Minute // HTTP request timeout
-	rateLimit          = 10               // Limit API requests to 10 per second
-	lfsFileThreshold   = 10 * 1024 * 1024 // 10MB threshold for LFS files
+	defaultMirrorURL     = "https://hf-mirror.com"
+	modelAPIPathPrefix   = "/api/models/"   // API prefix for models
+	datasetAPIPathPrefix = "/api/datasets/" // API prefix for datasets
+	resolvePathPrefix    = "/resolve/"
+	treePathPrefix       = "/tree/"
+	defaultBranch        = "main"
+	maxRetries           = 5
+	retryDelay           = 3 * time.Second
+	defaultWorkerCount   = 8
+	httpTimeout          = 30 * time.Minute
+	rateLimit            = 10
+	lfsFileThreshold     = 10 * 1024 * 1024
 )
 
 // --- Global HTTP Client ---
-// Using a shared transport allows for better connection reuse.
 var httpClient = &http.Client{
 	Timeout: httpTimeout,
 	Transport: &http.Transport{
@@ -57,15 +65,34 @@ type FileEntry struct {
 // Downloader encapsulates the download logic and configuration.
 type Downloader struct {
 	repoID          string
+	repoType        RepoType // Added to distinguish between model and dataset
 	branch          string
-	targetSubFolder string // User-specified subfolder to download
-	localModelDir   string // Local root directory for saving
+	targetSubFolder string
+	localModelDir   string
 	mirrorHost      string
 	proxyPrefix     string
 	workerCount     int
 	filesToDownload []FileEntry
 	totalSize       int64
 	apiRateLimiter  *rate.Limiter
+}
+
+// getAPIPathPrefix is a helper to get the correct API path. (NEW)
+func (d *Downloader) getAPIPathPrefix() string {
+	if d.repoType == RepoTypeDataset {
+		return datasetAPIPathPrefix
+	}
+	return modelAPIPathPrefix
+}
+
+// getResolveBasePath is a helper to get the correct base path for file URLs. (NEW)
+func (d *Downloader) getResolveBasePath() string {
+	if d.repoType == RepoTypeDataset {
+		// For datasets, the path is "datasets/{repoID}"
+		return "datasets/" + d.repoID
+	}
+	// For models, the path is just "{repoID}"
+	return d.repoID
 }
 
 // NewDownloader creates a Downloader instance by parsing user input.
@@ -83,7 +110,6 @@ func NewDownloader(rawURL, targetParentFolder, proxyURLHead, mirrorURL string, d
 		apiRateLimiter: rate.NewLimiter(rate.Limit(rateLimit), 1),
 	}
 
-	// Determine the Hugging Face domain to use (mirror or official)
 	if disableDefaultMirror {
 		d.mirrorHost = parsedURL.Scheme + "://" + parsedURL.Host
 		fmt.Printf("Default mirror disabled, using %s as base URL\n", d.mirrorHost)
@@ -93,6 +119,16 @@ func NewDownloader(rawURL, targetParentFolder, proxyURLHead, mirrorURL string, d
 
 	// Parse Repo ID, Branch, and Subfolder
 	pathParts := strings.Split(strings.TrimPrefix(parsedURL.Path, "/"), "/")
+
+	if len(pathParts) > 0 && pathParts[0] == "datasets" {
+		d.repoType = RepoTypeDataset
+		pathParts = pathParts[1:] // Slice off "datasets" part for subsequent parsing
+		fmt.Println("Dataset repository detected.")
+	} else {
+		d.repoType = RepoTypeModel
+		fmt.Println("Model repository detected.")
+	}
+
 	treeIndex := -1
 	for i, part := range pathParts {
 		if part == "tree" {
@@ -101,7 +137,7 @@ func NewDownloader(rawURL, targetParentFolder, proxyURLHead, mirrorURL string, d
 		}
 	}
 
-	if treeIndex == -1 { // URL does not contain /tree/
+	if treeIndex == -1 {
 		d.repoID = strings.Join(pathParts, "/")
 		d.branch = defaultBranch
 	} else {
@@ -129,10 +165,11 @@ func (d *Downloader) fetchFileListRecursive(ctx context.Context, currentPath str
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse mirror host: %w", err)
 	}
-	apiURL = apiURL.JoinPath(apiPathPrefix, d.repoID, treePathPrefix, d.branch, currentPath)
+
+	apiURL = apiURL.JoinPath(d.getAPIPathPrefix(), d.repoID, treePathPrefix, d.branch, currentPath)
+
 	reqURL := d.proxyPrefix + apiURL.String()
 
-	// Wait for the rate limiter
 	if err := d.apiRateLimiter.Wait(ctx); err != nil {
 		return nil, err
 	}
@@ -164,17 +201,16 @@ func (d *Downloader) fetchFileListRecursive(ctx context.Context, currentPath str
 
 	for _, entry := range rawEntries {
 		if entry.Type == "file" {
-			// If a subfolder is specified, only include files within that subfolder.
 			if d.targetSubFolder == "" || strings.HasPrefix(entry.Path, d.targetSubFolder+"/") || entry.Path == d.targetSubFolder {
 				fileURL, _ := url.Parse(d.mirrorHost)
-				fileURL = fileURL.JoinPath(d.repoID, "resolve", d.branch, entry.Path)
+				fileURL = fileURL.JoinPath(d.getResolveBasePath(), "resolve", d.branch, entry.Path)
 				entry.URL = fileURL.String()
 				entries = append(entries, entry)
 			}
 		} else if entry.Type == "directory" {
 			subEntries, err := d.fetchFileListRecursive(ctx, entry.Path)
 			if err != nil {
-				return nil, err // Propagate errors upwards
+				return nil, err
 			}
 			entries = append(entries, subEntries...)
 		}
@@ -186,7 +222,6 @@ func (d *Downloader) fetchFileListRecursive(ctx context.Context, currentPath str
 // Download starts the entire download process.
 func (d *Downloader) Download(ctx context.Context) error {
 	fmt.Println("Fetching file list... (This may take a moment)")
-	// Always start fetching from the repository root and filter during inclusion.
 	allFiles, err := d.fetchFileListRecursive(ctx, "")
 	if err != nil {
 		return fmt.Errorf("failed to fetch file list: %w", err)
@@ -198,13 +233,12 @@ func (d *Downloader) Download(ctx context.Context) error {
 		return nil
 	}
 
-	// Calculate total size
 	for _, file := range d.filesToDownload {
 		d.totalSize += file.Size
 	}
 
 	convertedSize, unit := convertBytes(float64(d.totalSize))
-	fmt.Printf("Model/Dataset Name: %s\n", path.Base(d.repoID))
+	fmt.Printf("Name: %s\n", path.Base(d.repoID))
 	if d.targetSubFolder != "" {
 		fmt.Printf("Target Subfolder: %s\n", d.targetSubFolder)
 	}
@@ -212,17 +246,14 @@ func (d *Downloader) Download(ctx context.Context) error {
 	fmt.Printf("Total files to download: %d\n", len(d.filesToDownload))
 	fmt.Printf("Total file size: %.2f %s\n", convertedSize, unit)
 
-	// Create local model directory
 	if err := os.MkdirAll(d.localModelDir, 0755); err != nil {
 		return fmt.Errorf("could not create target folder: %w", err)
 	}
 
-	// --- Concurrent Downloading ---
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(d.workerCount)
 
 	totalBar := pb.New64(d.totalSize).Set(pb.Bytes, true).SetTemplateString(`{{ "Total Progress:" }} {{ bar . }} {{percent . }} {{speed . "%s/s"}} {{etime .}}`)
-	// FIX: Do NOT call totalBar.Start() here. The pool will manage it.
 
 	pool, err := pb.StartPool(totalBar)
 	if err != nil {
@@ -231,15 +262,13 @@ func (d *Downloader) Download(ctx context.Context) error {
 	defer pool.Stop()
 
 	for _, file := range d.filesToDownload {
-		file := file // Capture loop variable
+		file := file
 		g.Go(func() error {
 			return d.processFileDownload(ctx, file, pool, totalBar)
 		})
 	}
 
 	if err := g.Wait(); err != nil {
-		// The final totalBar.Finish() will not be called on error, so we print a newline
-		// to ensure the next shell prompt starts on a new line.
 		fmt.Println()
 		return err
 	}
@@ -256,27 +285,20 @@ func (d *Downloader) processFileDownload(ctx context.Context, file FileEntry, po
 	}
 	localFilePath := filepath.Join(d.localModelDir, localRelativePath)
 
-	// Check if the file exists and has the correct size
 	if stat, err := os.Stat(localFilePath); err == nil {
 		if stat.Size() == file.Size {
-			// Use a mutex or a synchronized print function if this output gets garbled,
-			// but for simple infrequent messages like this, it's often fine.
-			// fmt.Printf("File %s already exists with the same size, skipping.\n", localRelativePath)
-			totalBar.Add64(file.Size) // Update total progress even if skipped
+			totalBar.Add64(file.Size)
 			return nil
 		}
 	}
 
-	// Note: The double '%%' is necessary to escape the percent sign for fmt.Sprintf.
 	fileBar := pb.New64(file.Size).Set(pb.Bytes, true).SetTemplateString(fmt.Sprintf(`{{ "%s:" }} {{ bar . }} {{percent . }} {{speed . "%%s/s"}}`, path.Base(file.Path)))
 	pool.Add(fileBar)
-	// We don't defer fileBar.Finish() here because the pool manages its lifecycle.
 
 	err := d.downloadFileWithRetry(ctx, file, localFilePath, fileBar, totalBar)
 	if err != nil {
 		errorMsg := fmt.Sprintf("Failed to download %s after max retries: %v", file.Path, err)
 		fileBar.SetTemplateString(fmt.Sprintf(`{{ "%s:" }} {{ "Download Failed" }}`, path.Base(file.Path))).Finish()
-		// Return a new error to avoid race conditions on the original error
 		return errors.New(errorMsg)
 	}
 	fileBar.Finish()
@@ -287,7 +309,6 @@ func (d *Downloader) processFileDownload(ctx context.Context, file FileEntry, po
 func (d *Downloader) downloadFileWithRetry(ctx context.Context, file FileEntry, localPath string, bar, totalBar *pb.ProgressBar) error {
 	var lastErr error
 	for i := 0; i < maxRetries; i++ {
-		// Check for context cancellation before each attempt
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -296,24 +317,21 @@ func (d *Downloader) downloadFileWithRetry(ctx context.Context, file FileEntry, 
 
 		err := d.downloadFileAtomically(ctx, file, localPath, bar, totalBar)
 		if err == nil {
-			return nil // Success
+			return nil
 		}
 		lastErr = err
 
-		// Exponential backoff for retries
 		delay := time.Duration(i*i)*time.Second + retryDelay
-		// Using the bar's writer to print the message ensures it doesn't mess up the progress bar rendering
 		bar.Set("prefix", fmt.Sprintf("Retry in %v... ", delay))
 		time.Sleep(delay)
-		bar.Set("prefix", fmt.Sprintf(`{{ "%s:" }}`, path.Base(file.Path))) // Reset prefix
-		bar.SetCurrent(0)                                                   // Reset progress bar for retry
+		bar.Set("prefix", fmt.Sprintf(`{{ "%s:" }}`, path.Base(file.Path)))
+		bar.SetCurrent(0)
 	}
 	return lastErr
 }
 
 // downloadFileAtomically performs the actual file download and ensures atomic writes.
 func (d *Downloader) downloadFileAtomically(ctx context.Context, file FileEntry, localPath string, bar, totalBar *pb.ProgressBar) error {
-	// Determine the starting point for a potential resume
 	var startOffset int64
 	tmpPath := localPath + ".tmp"
 	if stat, err := os.Stat(tmpPath); err == nil {
@@ -326,11 +344,8 @@ func (d *Downloader) downloadFileAtomically(ctx context.Context, file FileEntry,
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Set the Range header if we are resuming a download
 	if startOffset > 0 {
-		// If the existing temp file is already complete, we can skip the download
 		if startOffset == file.Size {
-			// We still need to update the total progress bar
 			totalBar.Add64(file.Size - bar.Current())
 			bar.SetCurrent(file.Size)
 			return os.Rename(tmpPath, localPath)
@@ -344,24 +359,20 @@ func (d *Downloader) downloadFileAtomically(ctx context.Context, file FileEntry,
 	}
 	defer resp.Body.Close()
 
-	// Handle the response status code
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return fmt.Errorf("request for %s failed with status: %s", file.URL, resp.Status)
 	}
 
-	// Create local directories
 	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	// Open the file for writing (append if resuming)
 	openFlags := os.O_CREATE | os.O_WRONLY
 	if resp.StatusCode == http.StatusPartialContent {
 		openFlags |= os.O_APPEND
 	} else {
-		// If not resuming, truncate the file
 		openFlags |= os.O_TRUNC
-		startOffset = 0 // Reset offset just in case
+		startOffset = 0
 	}
 	tmpFile, err := os.OpenFile(tmpPath, openFlags, 0644)
 	if err != nil {
@@ -369,21 +380,16 @@ func (d *Downloader) downloadFileAtomically(ctx context.Context, file FileEntry,
 	}
 	defer tmpFile.Close()
 
-	// Set the initial progress for the bars
 	bar.SetCurrent(startOffset)
-	// The total bar is updated via the proxy reader, so no need to set it manually here.
 
-	// Create a proxy reader to update progress bars
 	barReader := bar.NewProxyReader(resp.Body)
 	totalBarReader := totalBar.NewProxyReader(barReader)
 
-	// Copy data to the temporary file
 	_, err = io.Copy(tmpFile, totalBarReader)
 	if err != nil {
 		return fmt.Errorf("failed to write to file: %w", err)
 	}
 
-	// Rename the temporary file to the final destination
 	if err := os.Rename(tmpPath, localPath); err != nil {
 		return fmt.Errorf("failed to rename temporary file: %w", err)
 	}
@@ -423,9 +429,10 @@ func main() {
 	flag.IntVar(&workerCount, "w", defaultWorkerCount, "Number of concurrent downloads")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s -u <model_url> [options]\n", os.Args[0])
-		fmt.Fprintln(os.Stderr, "Examples:")
+		fmt.Fprintf(os.Stderr, "Usage: %s -u <model_or_dataset_url> [options]\n", os.Args[0])
+		fmt.Fprintln(os.Stderr, "\nExamples:")
 		fmt.Fprintf(os.Stderr, "  %s -u https://huggingface.co/google-bert/bert-base-uncased\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -u https://huggingface.co/datasets/squad\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -u https://hf-mirror.com/core42/stable-diffusion-3-medium-diffusers/tree/main/text_encoder_3 -f D:/models\n", os.Args[0])
 		fmt.Fprintln(os.Stderr, "\nOptions:")
 		flag.PrintDefaults()
@@ -444,11 +451,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Use a context to handle graceful shutdown (e.g., on Ctrl+C)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	// You can add a signal handler here to call cancel() on interrupt
 
 	if err := downloader.Download(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: An error occurred during the download process: %v\n", err)
