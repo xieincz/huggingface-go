@@ -77,7 +77,7 @@ type Downloader struct {
 	apiRateLimiter  *rate.Limiter
 }
 
-// getAPIPathPrefix is a helper to get the correct API path. (NEW)
+// getAPIPathPrefix is a helper to get the correct API path.
 func (d *Downloader) getAPIPathPrefix() string {
 	if d.repoType == RepoTypeDataset {
 		return datasetAPIPathPrefix
@@ -85,7 +85,7 @@ func (d *Downloader) getAPIPathPrefix() string {
 	return modelAPIPathPrefix
 }
 
-// getResolveBasePath is a helper to get the correct base path for file URLs. (NEW)
+// getResolveBasePath is a helper to get the correct base path for file URLs.
 func (d *Downloader) getResolveBasePath() string {
 	if d.repoType == RepoTypeDataset {
 		// For datasets, the path is "datasets/{repoID}"
@@ -279,11 +279,9 @@ func (d *Downloader) Download(ctx context.Context) error {
 
 // processFileDownload handles the download logic for a single file.
 func (d *Downloader) processFileDownload(ctx context.Context, file FileEntry, pool *pb.Pool, totalBar *pb.ProgressBar) error {
-	localRelativePath := file.Path
-	if d.targetSubFolder != "" {
-		localRelativePath = strings.TrimPrefix(file.Path, d.targetSubFolder+"/")
-	}
-	localFilePath := filepath.Join(d.localModelDir, localRelativePath)
+	// file.Path already contains the correct relative path from the repo root (e.g., "des/config.json").
+	// We join it directly with the local model directory to preserve the folder structure.
+	localFilePath := filepath.Join(d.localModelDir, file.Path)
 
 	if stat, err := os.Stat(localFilePath); err == nil {
 		if stat.Size() == file.Size {
